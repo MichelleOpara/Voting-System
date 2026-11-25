@@ -41,6 +41,14 @@ const redisUrl = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_U
 const redisToken = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN
 
 let getVotes, addVote, resetVotes
+let logVote = async () => {} // only does something when Redis is connected
+let claimVote, releaseVote
+let countBlocked = async () => {}
+
+// Max votes accepted from one network address (many people can share one).
+// Set the MAX_VOTES_PER_IP environment variable to change it. 0 turns the cap off.
+const envMax = parseInt(process.env.MAX_VOTES_PER_IP, 10)
+const MAX_PER_IP = Number.isNaN(envMax) ? 5 : envMax
 
 if (redisUrl && redisToken) {
   const { Redis } = require("@upstash/redis")
@@ -72,8 +80,53 @@ if (redisUrl && redisToken) {
     await redis.hincrby(KEY, label, 1)
   }
 
+  // One vote per browser (cookie ID), plus a cap on votes per network address.
+  // The ID goes into the "voters" set; sadd is atomic, so two simultaneous
+  // requests from one browser can't both succeed. "ipcounts" holds accepted
+  // votes per scrambled network address.
+  claimVote = async (voterId, ipHash) => {
+    const added = await redis.sadd("voters", voterId)
+    if (!added) return "already_voted"
+    const count = await redis.hincrby("ipcounts", ipHash, 1)
+    if (MAX_PER_IP > 0 && count > MAX_PER_IP) {
+      await redis.hincrby("ipcounts", ipHash, -1)
+      await redis.srem("voters", voterId)
+      return "network_limit"
+    }
+    return "ok"
+  }
+
+  // Undo a claim if saving the vote failed afterwards
+  releaseVote = async (voterId, ipHash) => {
+    await redis.srem("voters", voterId)
+    await redis.hincrby("ipcounts", ipHash, -1)
+  }
+
+  // Counts how many repeat votes were turned away ("blockedvotes" key)
+  countBlocked = async () => {
+    try {
+      await redis.incr("blockedvotes")
+    } catch {}
+  }
+
+  // Vote log: one entry per vote (newest first) in the "votelog" list.
+  // IPs are hashed, so the raw address is never stored.
+  logVote = async ({ label, ip, ua }) => {
+    const ipHash = hashIp(ip)
+    const device = /mobile|android|iphone|ipad/i.test(ua) ? "mobile" : "desktop"
+    const entry = JSON.stringify({
+      time: new Date().toISOString(), // UTC. Lagos is UTC+1
+      contestant: label,
+      ipHash,
+      device,
+      browser: ua.slice(0, 100),
+    })
+    await redis.lpush("votelog", entry)
+    await redis.ltrim("votelog", 0, 4999) // keep the latest 5000 votes
+  }
+
   resetVotes = async () => {
-    await redis.del(KEY)
+    await redis.del(KEY, "votelog", "ipcounts", "voters", "blockedvotes")
     seeded = null
     await ensureSeeded() // recreates every contestant at the starting score
   }
@@ -106,13 +159,60 @@ if (redisUrl && redisToken) {
     return job
   }
 
+  // Local testing only: remembered in memory, so restarting the server clears it
+  const localVoters = new Set()
+  const localIps = new Map()
+
+  claimVote = async (voterId, ipHash) => {
+    if (localVoters.has(voterId)) return "already_voted"
+    const count = (localIps.get(ipHash) || 0) + 1
+    if (MAX_PER_IP > 0 && count > MAX_PER_IP) return "network_limit"
+    localVoters.add(voterId)
+    localIps.set(ipHash, count)
+    return "ok"
+  }
+
+  releaseVote = async (voterId, ipHash) => {
+    localVoters.delete(voterId)
+    localIps.set(ipHash, Math.max(0, (localIps.get(ipHash) || 1) - 1))
+  }
+
   resetVotes = () => {
+    localVoters.clear()
+    localIps.clear()
     const job = queue.then(() => fs.writeFile(dataFile, JSON.stringify(INITIAL, null, 2)))
     queue = job.catch(() => {})
     return job
   }
 
   console.log("Storage: local data.json")
+}
+
+// ---------- Helpers ----------
+function hashIp(ip) {
+  return crypto
+    .createHash("sha256")
+    .update(ip + (process.env.LOG_SALT || "delife"))
+    .digest("hex")
+    .slice(0, 12)
+}
+
+function readCookie(req, name) {
+  const header = req.headers.cookie || ""
+  for (const part of header.split(";")) {
+    const [key, ...rest] = part.trim().split("=")
+    if (key === name) return decodeURIComponent(rest.join("="))
+  }
+  return null
+}
+
+function clientIp(req) {
+  // On Vercel the visitor's address arrives in the x-forwarded-for header
+  const forwarded = req.headers["x-forwarded-for"]
+  if (typeof forwarded === "string" && forwarded.length > 0) {
+    return forwarded.split(",")[0].trim()
+  }
+  return req.socket.remoteAddress || "unknown"
 }
 
 // ---------- Poll API ----------
@@ -144,8 +244,37 @@ app.post("/poll", async (req, res) => {
     return res.status(400).json({ error: "Unknown contestant" })
   }
 
+  // Each browser gets a random voter ID in a cookie (kept for a year)
+  let voterId = readCookie(req, "voter")
+  if (!voterId || !/^[0-9a-f-]{36}$/.test(voterId)) voterId = crypto.randomUUID()
+  const secure = req.headers["x-forwarded-proto"] === "https" ? "; Secure" : ""
+  res.setHeader(
+    "Set-Cookie",
+    `voter=${voterId}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${secure}`
+  )
+
+  const ip = clientIp(req)
+  const ipHash = hashIp(ip)
+
   try {
-    await addVote(label)
+    const claim = await claimVote(voterId, ipHash)
+    if (claim !== "ok") {
+      await countBlocked()
+      return res.status(claim === "already_voted" ? 409 : 429).json({ error: claim })
+    }
+
+    try {
+      await addVote(label)
+    } catch (err) {
+      await releaseVote(voterId, ipHash) // give the claim back so they can retry
+      throw err
+    }
+
+    try {
+      await logVote({ label, ip, ua: req.headers["user-agent"] || "" })
+    } catch (err) {
+      console.error("Vote log failed (the vote was still counted):", err)
+    }
     res.json({ ok: true })
   } catch (err) {
     console.error("POST /poll failed:", err)

@@ -6,10 +6,14 @@ const contestantMedia = {
     "Mercy (Osun)":   { img: "/images/15.jpeg", audio: "/Audio/Mercy.ogg" },
 }
 
+// The browser remembers who has voted under this name. It lasts across tabs and restarts.
+// To let EVERYONE vote again (for example after a reset), change "v1" to "v2".
+const STORAGE_KEY = "voted_v1"
+
 class Poll {
     constructor(root) {
         this.root = root
-        this.selected = sessionStorage.getItem("selected")
+        this.selected = localStorage.getItem(STORAGE_KEY)
         // Relative URL: works locally and once deployed, since the same server serves the page
         this.endpoint = "/poll"
 
@@ -68,11 +72,23 @@ class Poll {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ add: label }),
             })
+            if (response.status === 409) {
+                // The server already has a vote from this browser
+                this.selected = "already"
+                localStorage.setItem(STORAGE_KEY, "already")
+                alert("You have already voted. Thank you!")
+                this._refresh()
+                return
+            }
+            if (response.status === 429) {
+                alert("Too many votes have already come from this network. Please try from a different connection.")
+                return
+            }
             if (!response.ok) throw new Error("Server returned " + response.status)
 
             // Only lock the user out after the vote actually succeeded
             this.selected = label
-            sessionStorage.setItem("selected", label)
+            localStorage.setItem(STORAGE_KEY, label)
             this._refresh()
         } catch (err) {
             console.error("Vote failed:", err)
