@@ -1,9 +1,9 @@
 // Photo + audio for each contestant, keyed by the exact label in data.json.
 // Adjust the paths if your files are named differently.
 const contestantMedia = {
-    "Prisca (Lagos)": { img: "/images/14.jpeg", audio: "/Audios/1.ogg" },
-    "Victor (Lagos)": { img: "/images/13.jpeg", audio: "/Audios/1.ogg" },
-    "Mercy (Osun)":   { img: "/images/15.jpeg", audio: "/Audios/1.ogg" },
+    "Prisca (Lagos)": { img: "/images/14.jpeg", audio: "/Audio/Prisca.ogg" },
+    "Victor (Lagos)": { img: "/images/13.jpeg", audio: "/Audio/Victor.ogg" },
+    "Mercy (Osun)":   { img: "/images/15.jpeg", audio: "/Audio/Mercy.ogg" },
 }
 
 class Poll {
